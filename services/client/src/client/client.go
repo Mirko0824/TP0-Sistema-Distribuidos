@@ -18,6 +18,7 @@ const CONNECTION_ATTEMPS_DELAY_MS = 200
 
 const HEADER_SIZE = 4
 const EOF_MESSAGE = "EOF"
+const BATCH_SIZE = 100
 
 type ClientConfig struct {
 	ServerHost string
@@ -64,32 +65,6 @@ func connectToServer(host, port string) (net.Conn, error) {
 	return conn, err
 }
 
-func sendMessage(client *Client, message string, messageId int) error {
-	// Agrego la agency_id al mensaje
-	message = client.config.AgencyId + "," + message
-	// Logueo los argumentos del mensaje
-	logger.Info("send-message", logger.Success, "message", message)
-
-	// Obtengo el tamaño del mensaje en bytes
-	totalBytesMessage := uint32(len(message))
-	// Creo el encabezado con el tamaño del mensaje
-	headerMessage := make([]byte, HEADER_SIZE)
-	// Lo escribo en big endian y lo guardo en el headerMessage
-	binary.BigEndian.PutUint32(headerMessage, totalBytesMessage)
-
-	// Envio el headerMessage antes que el mensaje principal
-	if err := safe_socket.SendAll(client.conn, headerMessage); err != nil {
-		logger.Error("send-message", logger.Fail, "agency-id", client.config.AgencyId, "message-id", messageId)
-		return err
-	}
-	// Envio el mensaje principal
-	if err := safe_socket.SendAll(client.conn, []byte(message)); err != nil {
-		logger.Error("send-message", logger.Fail, "agency-id", client.config.AgencyId, "message-id", messageId)
-		return err
-	}
-	return nil
-}
-
 func handleOpenFile(client *Client, filePath string, openMode int) (*os.File, error) {
 	const action = "open-file"
 	logger.Info(action, logger.InProgress, "file", filePath)
@@ -102,6 +77,26 @@ func handleOpenFile(client *Client, filePath string, openMode int) (*os.File, er
 	}
 
 	return file, nil
+}
+
+func handleReadFile(file *os.File, reader *csv.Reader, agencyId string) ([]string, error) {
+	// Creo un array para guardar todas las lineas que leo del csv
+	var batch []string
+	// Leo la cantidad de linea que defina BATCH_SIZE
+	for i := 0; i < BATCH_SIZE; i++ {
+		readedTexts, err := reader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			logger.Error("read-input-file", logger.Fail, "err", err)
+			return nil, err
+		}
+		// Agrego el AgencyId delante de la row leida
+		batch = append(batch, agencyId + "," + strings.Join(readedTexts, ","))
+	}
+
+	return batch, nil
 }
 
 func handleSend(client *Client, headerMessage []byte, clientMessage []byte, messageArgs ...any) error {
@@ -168,26 +163,24 @@ func (client *Client) Run() error {
 	var messageArgs []any
 	// Inicio bucle para leer linea por linea del csv y envio al servidor
 	for {
-		// Leo una fila del csv, donde me devuelve un slice de strings
-		readedTexts, err := reader.Read()
-		// Si llego al fin del archivo, salgo del bucle
-		if err == io.EOF {
-			break
-		}
+		// Leo el archivo
+		readedBatch, err := handleReadFile(inputFile, reader, client.config.AgencyId)
 		if err != nil {
-			logger.Error("read-input-file", logger.Fail, "err", err)
 			return err
 		}
+		if len(readedBatch) == 0 {
+			break
+		}
+
 		// Sumo 2 porque se envia header + mensaje
 		messageId += 2
 		messageArgs := []any{"agency-id", client.config.AgencyId, "message-id", messageId}
 
-		// Armo el mensaje separado en comas
-		clientMessage := strings.Join(readedTexts, ",")
-		// Agrego la agency_id al mensaje
-		clientMessage = client.config.AgencyId + "," + clientMessage
+		// Armo el mensaje separando cada row del csv leido separado con \n
+		// Para que del lado del servidor pueda detectar el fin de cada linea
+		clientMessage := strings.Join(readedBatch, "\n")
 		// Logueo los argumentos del mensaje
-		logger.Info("send-message", logger.Success, "message", clientMessage)
+		// logger.Info("send-message", logger.Success, "message", clientMessage)
 
 		// Obtengo el tamaño del mensaje en bytes
 		totalBytesMessage := uint32(len(clientMessage))
@@ -199,6 +192,16 @@ func (client *Client) Run() error {
 		if err := handleSend(client, headerMessage, []byte(clientMessage), messageArgs...); err != nil {
 			return err
 		}
+		// Recibo el ack del server de que proceso correctamente lo que le envie
+		ack, err := handleReceive(client)
+		if err != nil {
+			return err
+		}
+		if string(ack) != "ACK" {
+			logger.Error("recv-ack", logger.Fail, "agency-id", client.config.AgencyId, "message-id", messageId)
+			return err
+		}
+		logger.Info("recv-ack", logger.Success, "agency-id", client.config.AgencyId, "message-id", messageId)
 	}
 
 	// Preparo mensaje de fin
