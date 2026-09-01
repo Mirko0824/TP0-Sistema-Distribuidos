@@ -18,7 +18,6 @@ const CONNECTION_ATTEMPS_DELAY_MS = 200
 
 const HEADER_SIZE = 4
 const EOF_MESSAGE = "EOF"
-const BATCH_SIZE = 100
 
 type ClientConfig struct {
 	ServerHost string
@@ -26,6 +25,7 @@ type ClientConfig struct {
 	AgencyId   string
 	InputFile  string 
 	OutputFile string
+	BatchSize  int
 }
 
 type Client struct {
@@ -79,24 +79,25 @@ func handleOpenFile(client *Client, filePath string, openMode int) (*os.File, er
 	return file, nil
 }
 
-func handleReadFile(file *os.File, reader *csv.Reader, agencyId string) ([]string, error) {
-	// Creo un array para guardar todas las lineas que leo del csv
-	var batch []string
-	// Leo la cantidad de linea que defina BATCH_SIZE
-	for i := 0; i < BATCH_SIZE; i++ {
+func handleReadFile(client *Client, file *os.File, reader *csv.Reader, agencyId string, batch *[]string) error {
+	// Reseteo la variable batch para limpiar basura
+	// Modifico la variable original que recibo por parametro y no una copia
+	*batch = (*batch)[:0] 
+	// Leo la cantidad de linea que defina BatchSize
+	for i := 0; i < client.config.BatchSize; i++ {
 		readedTexts, err := reader.Read()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
 			logger.Error("read-input-file", logger.Fail, "err", err)
-			return nil, err
+			return err
 		}
 		// Agrego el AgencyId delante de la row leida
-		batch = append(batch, agencyId + "," + strings.Join(readedTexts, ","))
+		*batch = append(*batch, agencyId + "," + strings.Join(readedTexts, ","))
 	}
 
-	return batch, nil
+	return nil
 }
 
 func handleSend(client *Client, headerMessage []byte, clientMessage []byte, messageArgs ...any) error {
@@ -161,10 +162,14 @@ func (client *Client) Run() error {
 	// Inicializo un contador de mensajes
 	messageId := 0
 	var messageArgs []any
+
+	// Inicializo readedBatch en 0 y capacidad BatchSize
+	readedBatch := make([]string, 0, client.config.BatchSize)
+
 	// Inicio bucle para leer linea por linea del csv y envio al servidor
 	for {
 		// Leo el archivo
-		readedBatch, err := handleReadFile(inputFile, reader, client.config.AgencyId)
+		err := handleReadFile(client, inputFile, reader, client.config.AgencyId, &readedBatch)
 		if err != nil {
 			return err
 		}
