@@ -3,21 +3,26 @@ import logger
 import safe_socket
 from lottery.lottery import Lottery
 from lottery.bet import Bet
-
-HEADER_SIZE = 4
-
+from threading import Thread, Lock, Event
+from protocol.server_protocol import ServerProtocol
 
 class Server:
-    def __init__(self, server_host: str, server_port: int) -> None:
+    def __init__(self, server_host: str, server_port: int, agencyQuorumMin: int) -> None:
         self.server_host = server_host
         self.server_port = server_port
+        self.agencyQuorumMin = agencyQuorumMin
         # Inicializo la instancia de lottery
-        self.lottery = Lottery("all_bets.csv")
+        self.lottery = Lottery("all-bets.csv")
+        self.lock = Lock() # Inicializo la instancia de lock
+        self.agencies = [] # Inicializo la lista de threads
+        self.agenciesCompleted = 0 # Inicializo contador de agencias que completaron el envio
+        self.agenciesQuorum = Event() # Inicializo el semaforo para para avisar que se cumplio el quorum
 
-    def _handle_bets(self, client_message):
+    def _handle_bets(self, clientMessage):
+        messageBatch = clientMessage.split("\n")
         # Creo el objeto bet con los datos recibidos del cliente
         bets_list = []
-        for b in client_message:
+        for b in messageBatch:
             # Convierto en lista cada row
             b_row = b.split(",")
             # Creo el objeto bet con los datos recibidos del cliente
@@ -31,115 +36,109 @@ class Server:
             )
             # Agrego el bet a la lista
             bets_list.append(bet)
-        # Guardo todas la lista de apuetas recibidas
-        self.lottery.store_bets(bets_list)
-
-    def _send_eof(self, client_socket, agencyId, messageId):
-        # Encodeo el mensaje EOF y transformo a big endian para el header
-        endMessage = "EOF".encode("utf-8")
-        if self._handle_send_message(client_socket, agencyId, messageId, endMessage) is None:
-            logger.error("send-eof", logger.LogResult.fail, "agency-id", agencyId, "message-id", messageId)
-            return None
-
-        return True
-    
-    def _send_ack(self, client_socket, agencyId, messageId):
-        # Enviar ACK al cliente por haber completado el procesamiento del batch
-        ack = "ACK".encode("utf-8")
-        if self._handle_send_message(client_socket, agencyId, messageId, ack) is None:
-            logger.error("send-ack", logger.LogResult.fail, "agency-id", agencyId, "message-id", messageId)
-            return None
-
-        return True
-
-    def _handle_send_message(self, client_socket, agencyId, messageId, message):
-        # Obtengo el tamaño del mensaje en bytes
-        totalBytesMessage = len(message)
-        # Creo el encabezado con el tamaño del mensaje
-        headerMessage = totalBytesMessage.to_bytes(HEADER_SIZE, byteorder="big")
-        # Envio el header con la cantidad de bytes a enviar
-        if safe_socket.send_all(client_socket, headerMessage) is None:
-            logger.error("send-message", logger.LogResult.fail, "agency-id", agencyId, "message-id", messageId)
-            return None
-        # Envio el mensaje
-        if safe_socket.send_all(client_socket, message) is None:
-            logger.error("send-message", logger.LogResult.fail, "agency-id", agencyId, "message-id", messageId)
-            return None
-
-        return True
+        # Guardo todas la lista de bets recibidas
+        # Uso lock aca para proteger de este metodo que es de uso compartido
+        with self.lock:
+            self.lottery.store_bets(bets_list)
 
     def _handle_client(self, client_socket):
+        # Inicializo la instancia del protocolo de servidor
+        protocol = ServerProtocol(client_socket)
+
         action = "handle-client"
         message_amount = 0
-        current_agency_id = None
+        currentAgencyId = None
         try:
             logger.info(action, logger.LogResult.in_progress)
             while True:
-                # Recibo el header que me dice cuantos bytes voy a recibir
-                headerToReceive = safe_socket.recv_all(client_socket, HEADER_SIZE)
-                # Si no recibo nada, salgo del bucle
-                if not headerToReceive:
+                # Recibo el codigo de la operacion
+                operationCode = protocol.receiveOperationCode(message_amount)
+                if operationCode is None:
                     logger.info(action, logger.LogResult.success, "messages-amount", message_amount)
                     break
-                # Decodifico el header para saber cuantos bytes voy a recibir y convierto a int
-                totalBytesToReceive = int.from_bytes(headerToReceive, byteorder="big")
-
-                # Recibo el mensaje indicando la cantidad exacta de bytes que voy a recibir
-                client_message = safe_socket.recv_all(client_socket, totalBytesToReceive)
-                if not client_message:
-                    logger.info(action, logger.LogResult.success, "messages-amount", message_amount)
-                    return None
+                message_amount += 1
                 
-                message_amount += 2
-                # Decodifico el mensaje recibido a utf-8
-                client_message_decoded = client_message.decode("utf-8")
+                # Despues de haber recibido el codigo de operacion, envio un ack al cliente notificando que lo recibi bien
+                if protocol.sendCode("ACK", message_amount) is None:
+                    logger.error("send-ack", logger.LogResult.fail, "agency-id", currentAgencyId, "message-id", message_amount)
+                    return None
+                message_amount += 1
 
-                # Si recibo "EOF", significa que el cliente termino de enviarme todo
-                if client_message_decoded == "EOF":
+                # Verifico si recibi un codigo de eof o batch
+                if operationCode == "EOF":
                     logger.info("finish-receiving-messages", logger.LogResult.success, "messages-amount", message_amount)
                     break
-
-                # Separo cada row del csv
-                bet_rows = client_message_decoded.split("\n")
-                # Guardo el agencyId del cliente actual
-                current_agency_id = int(bet_rows[0].split(",")[0])
-                self._handle_bets(bet_rows)
-
-                # Envio ACK al cliente por haber completado el procesamiento del batch
-                if self._send_ack(client_socket, current_agency_id, message_amount) is None:
-                    logger.error("send-ack", logger.LogResult.fail, "agency-id", current_agency_id, "message-id", message_amount)
-                    return None
                 
-                message_amount += 2
+                if operationCode == "BATCH":
+                    clientMessage = protocol.receiveMessage(message_amount)
+                    if clientMessage is None:
+                        logger.error("receive-message", logger.LogResult.fail, "agency-id", currentAgencyId, "message-id", message_amount)
+                        return None
+                    message_amount += 1
 
-            # Obtengo cada ganador y armo el mensaje
+                    # Verifico si el agencyId no esta asignado
+                    if currentAgencyId is None:
+                        # Obtengo la primera linea
+                        firstLine = clientMessage.split("\n")[0]
+                        # Obtengo el agencyId de la primera linea
+                        currentAgencyId = int(firstLine.split(",")[0])
+                        # Paso el agencyId al protocolo
+                        protocol.setAgencyId(currentAgencyId)
+
+                    self._handle_bets(clientMessage)
+                    # Envio ack al cliente por haber completado el procesamiento del batch
+                    if protocol.sendCode("ACK", message_amount) is None:
+                        return None
+                    message_amount += 1
+            
+            # Despues de recibir todo del cliente, pido el lock para incrementar la cantidad de agencias que completaron
+            # Verifico que se cumplio el quorum para comenzar a enviar los ganadores
+            with self.lock:
+                self.agenciesCompleted += 1
+                if self.agenciesCompleted == self.agencyQuorumMin:
+                    # Si se cumple el quorum, avisa a todos los threads que estan esperando
+                    self.agenciesQuorum.set()
+
+            # Se duerme el thread hasta que se cumpla el quorum
+            self.agenciesQuorum.wait()
+
+            # Una vez que se cumple el quorum, obtengo cada ganador y armo el mensaje
             for bet in self.lottery.load_bets():
-                # Si el apostador no gano o no pertenece a la agencia actual, lo salto
-                if (not self.lottery.has_won(bet)) or (bet.agency_id != current_agency_id):
+                # Si el apostador no gano o no pertenece a la agencia actual, lo salteo
+                if (not self.lottery.has_won(bet)) or (bet.agency_id != currentAgencyId):
                     continue
 
                 # Concateno todos los datos del ganador en un string separado por comas
                 winnerBet = bet.first_name + "," + bet.last_name + "," + str(bet.document) + "," + bet.birthdate + "," + str(bet.number)
-                # Encondeo el mensaje para enviarlo
-                betMessage = winnerBet.encode("utf-8")
-                # Envio el header y el mensaje
-                if self._handle_send_message(client_socket, bet.agency_id, message_amount, betMessage) is None:
-                    logger.error("send-response", logger.LogResult.fail, "agency-id", bet.agency_id, "message-id", message_amount)
+                
+                # Envio el codigo de operacion de winner al cliente
+                if protocol.sendCode("WINNER", message_amount) is None:
                     return None
+                message_amount += 1
 
+                # Recibo el codigo de operacion de ack de parte del cliente
+                if protocol.receiveOperationCode(message_amount) is None:
+                    return None
+                message_amount += 1
+
+                # Envio el mensaje de ganador
+                if protocol.sendMessage(winnerBet, message_amount) is None:
+                    return None
+                # Sumo 2 porque se envia header y mensaje
                 message_amount += 2
 
-            # Envio el mensaje de fin al cliente, indicando de que termine de enviar todo
-            if self._send_eof(client_socket, current_agency_id, message_amount) is None:
+            if protocol.sendCode("EOF", message_amount) is None:
                 return None
-            
-            client_socket.close()
+            message_amount += 1
 
         except Exception as e:
             logger.error(
                 action, logger.LogResult.fail, "messages-amount", message_amount
             )
             raise e
+        finally:
+            # Aseguro que siempre se cierre el socket
+            client_socket.close()
 
     def run(self):
         action = "accept-connection"
@@ -150,9 +149,13 @@ class Server:
                 try:
                     logger.info(action, logger.LogResult.in_progress)
                     client_socket, _ = server_socket.accept()
+                    # Creo un thread para cada conexion nueva que llega
+                    # Paso por parametro que funcion tiene que ejecutar el thread y los argumento
+                    newConnection = Thread(target=self._handle_client, args=(client_socket,))
+                    newConnection.start()
+                    # Agrego el thread a la lista de threads
+                    self.agencies.append(newConnection)
                 except Exception as e:
                     logger.error(action, logger.LogResult.fail)
                     raise e
                 logger.info(action, logger.LogResult.success)
-
-                self._handle_client(client_socket)

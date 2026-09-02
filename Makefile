@@ -19,6 +19,7 @@ logs:
 .PHONY: logs
 
 test:
-	rm failed_test.log -f
+# 	rm failed_test.log -f En mac no funciona
+	rm -f failed_test.log 
 	PYTHONPATH="$(PWD)" python3 tests/run.py
 .PHONY: test
