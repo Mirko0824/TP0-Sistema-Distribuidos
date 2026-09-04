@@ -157,7 +157,7 @@ func (client *Client) Run() error {
 	messageId := 0
 
 	// Inicializo un buffer de bytes para el batch
-	var batchBuffer bytes.buffer
+	var batchBuffer bytes.Buffer
 	
 	// Inicio bucle para leer linea por linea del csv y envio al servidor
 	for client.active {
