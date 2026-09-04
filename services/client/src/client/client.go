@@ -5,7 +5,7 @@ import (
 	"time"
 	"os"
 	"bufio"
-	"strings"
+	"bytes"
 
 	"github.com/7574-sistemas-distribuidos/tp-nivelador/src/logger"
 	"github.com/7574-sistemas-distribuidos/tp-nivelador/src/protocol"
@@ -27,6 +27,7 @@ type Client struct {
 	conn       net.Conn
 	config     ClientConfig
 	protocol   *protocol.ClientProtocol
+	active     bool
 }
 
 func NewClient(config ClientConfig) (*Client, error) {
@@ -38,8 +39,16 @@ func NewClient(config ClientConfig) (*Client, error) {
 	// Inicializo la instancia de protocolo
 	clientProtocol := protocol.NewClientProtocol(conn, config.AgencyId)
 
-	client := &Client{conn: conn, config: config, protocol: clientProtocol}
+	client := &Client{conn: conn, config: config, protocol: clientProtocol, active: true}
 	return client, nil
+}
+
+func (client *Client) Stop() {
+	client.active = false
+	if client.conn != nil {
+		// Cierro la conn del cliente
+		client.conn.Close()
+	}
 }
 
 func connectToServer(host, port string) (net.Conn, error) {
@@ -76,10 +85,10 @@ func handleOpenFile(client *Client, filePath string, openMode int) (*os.File, er
 	return file, nil
 }
 
-func handleReadFile(client *Client, scanner *bufio.Scanner, agencyId string, batch *[]string) error {
-	// Reseteo la variable batch
-	// Modifico la variable original que recibo por parametro y no una copia
-	*batch = (*batch)[:0] 
+func handleReadFile(client *Client, scanner *bufio.Scanner, agencyId string, buf *bytes.Buffer) (bool, error) {
+	// Reseteo el buffer
+	buf.Reset()
+	linesRead := 0
 	// Leo la cantidad de linea que defina BatchSize
 	for i := 0; i < client.config.BatchSize; i++ {
 		// Leo la siguiente linea
@@ -87,18 +96,35 @@ func handleReadFile(client *Client, scanner *bufio.Scanner, agencyId string, bat
 			err := scanner.Err()
 			if err != nil {
 				logger.Error("read-input-file", logger.Fail, "err", err)
-				return err
+				return false, err
 			}
 			// Si no hay error pero scan devuelve false
 			// llegue al final del archivo, salgo
 			break
 		}
-		// Obtengo el texto de la row leida
-		row := scanner.Text()
-		// Agrego el agencyId delante de la row leida
-		*batch = append(*batch, agencyId + "," + row)
+
+		// Despues de leer la primera linea, si el buffer no tiene capacidad suficiente
+		// se calcula en base a los bytes de la linea + agencyId + coma + salto de linea
+		// y reservo memoria multiplicando por el BatchSize para evitar reallocaciones de memoria
+		if linesRead == 0 && buf.Cap() == 0 {
+			estimatedLineSize := len(scanner.Bytes()) + len(agencyId) + 2
+			buf.Grow(estimatedLineSize * client.config.BatchSize)
+		}
+
+		// Empiezo a agregar \n despues de la primera linea
+		// Separo cada linea con \n
+		if linesRead > 0 {
+			buf.WriteByte('\n')
+		}
+		// Escribo el agencyId y la coma en el buff
+		buf.WriteString(agencyId)
+		buf.WriteByte(',')
+		// Escribo la linea en bytes
+		buf.Write(scanner.Bytes())
+		linesRead++
 	}
-	return nil
+	// Devuelvo true si leyo por lo menos una linea
+	return linesRead > 0, nil
 }
 
 func (client *Client) Run() error {
@@ -119,29 +145,30 @@ func (client *Client) Run() error {
 	}
 	// Uso defer para cerrar el archivo cuando termine la funcion
 	defer outputFile.Close()
+
+	// Uso un bufio.Writer para el archivo de salida
+	outputWriter := bufio.NewWriter(outputFile)
+	defer outputWriter.Flush()
+
 	// Declaro un scanner para leer el archivo de input
 	scanner := bufio.NewScanner(inputFile)
 
 	// Inicializo un contador de mensajes
 	messageId := 0
 
-	// Inicializo readedBatch en 0 y con el size del batch
-	readedBatch := make([]string, 0, client.config.BatchSize)
-
+	// Inicializo un buffer de bytes para el batch
+	var batchBuffer bytes.buffer
+	
 	// Inicio bucle para leer linea por linea del csv y envio al servidor
-	for {
-		// Leo el archivo usando el scanner
-		err := handleReadFile(client, scanner, client.config.AgencyId, &readedBatch)
+	for client.active {
+		// Leo el archivo usando el scanner y el buffer
+		hasLines, err := handleReadFile(client, scanner, client.config.AgencyId, &batchBuffer)
 		if err != nil {
 			return err
 		}
-		if len(readedBatch) == 0 {
+		if !hasLines {
 			break
 		}
-
-		// Armo el mensaje separando cada row del csv leido separado con \n
-		// Para que del lado del servidor pueda detectar el fin de cada linea
-		clientMessage := strings.Join(readedBatch, "\n")
 
 		// Envio el codigo de operacion batch
 		if err := client.protocol.SendCode("BATCH", messageId); err != nil {
@@ -157,8 +184,9 @@ func (client *Client) Run() error {
 		}
 		messageId++
 
-		// Envio el batch
-		if err := client.protocol.SendMessage(clientMessage, messageId); err != nil {
+		// Envio el batch, pasando directamente los bytes del buffer
+		// Hago batchBuffer.Bytes() para convertilo en un slice de bytes
+		if err := client.protocol.SendMessage(batchBuffer.Bytes(), messageId); err != nil {
 			return err
 		}
 
@@ -190,7 +218,7 @@ func (client *Client) Run() error {
 
 	logger.Info("send-finish-message", logger.Success)
 
-	for {
+	for client.active {
 		// Recibo el codigo de operacion, espero recibir codigo de winner o eof
 		receivedCode, err := client.protocol.ReceiveOperationCode(messageId)
 		if err != nil {
@@ -218,17 +246,16 @@ func (client *Client) Run() error {
 		}
 		messageId++
 
-		logger.Info("receive-response", logger.Success, "response", string(receivedResponse))
-
-		// Convierto el mensaje recibido a string y le agrego un salto de linea
-		outputMessage := string(receivedResponse) + "\n"
-
-		// Escribo el mensaje en el archivo de output
-		if _, err := outputFile.WriteString(outputMessage); err != nil {
+		// Escribo el mensaje de output directamente en el writer bufferizado
+		if _, err := outputWriter.Write(receivedResponse); err != nil {
 			logger.Error("write-output-file", logger.Fail, "err", err)
 			return err
 		}
-		logger.Info("write-output-file", logger.Success, "file", client.config.OutputFile)
+		// Escribo el salto de linea (sin crear slice de bytes nuevo)
+		if err := outputWriter.WriteByte('\n'); err != nil {
+			logger.Error("write-output-file", logger.Fail, "err", err)
+			return err
+		}
 
 	}
 	logger.Info("all-messages-sent-and-received", logger.Success, "agency-id", client.config.AgencyId, "messages-amount", messageId)

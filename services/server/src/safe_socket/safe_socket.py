@@ -33,9 +33,9 @@ def send_all(socket: socket.socket, data: bytes):
         # data[totalSentBytes:]: cantidad de bytes restantes por enviar
         # sentBytes: cantidad de bytes enviados
         sentBytes = socket.send(data[totalSentBytes:])
-        # Si no se envian bytes, devuelvo None
-        if not sentBytes:
-            return None
+        # Si no se pudo realizar el envio, se reintenta
+        if sentBytes == 0:
+            continue
         # Aumento el contador de total de bytes enviados
         totalSentBytes += sentBytes
 

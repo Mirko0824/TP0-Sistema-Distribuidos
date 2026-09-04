@@ -11,14 +11,39 @@ class Server:
         self.server_host = server_host
         self.server_port = server_port
         self.agencyQuorumMin = agencyQuorumMin
-        # Inicializo la instancia de lottery
-        self.lottery = Lottery("all-bets.csv")
+        self.lottery = Lottery("all-bets.csv") # Inicializo la instancia de lottery
         self.lock = Lock() # Inicializo la instancia de lock
         self.agencies = [] # Inicializo la lista de threads
+        self.client_sockets = [] # Lista de sockets de clientes activos
         self.agenciesCompleted = 0 # Inicializo contador de agencias que completaron el envio
         self.agenciesQuorum = Event() # Inicializo el semaforo para para avisar que se cumplio el quorum
+        self.active = True
+    
+    def stopServer(self):
+        self.active = False
+        
+        # Desbloqueo a todos los threads que esten esperando el quorum
+        self.agenciesQuorum.set()
+        
+        # Cierro todas las conexiones con los clientes para abortar inmediatamente cualquier lectura/escritura
+        for sock in self.client_sockets:
+            try:
+                sock.close()
+            except OSError:
+                pass
 
-    def _handle_bets(self, clientMessage):
+        if hasattr(self, 'server_socket'):
+            self.server_socket.close()
+            logger.info("server-shutdown", logger.LogResult.success)
+    
+    def _stopThreads(self):
+        # Espero a que todos los threads terminen su ejecucion
+        for t in self.agencies:
+            logger.info("joining thread", logger.LogResult.in_progress)
+            t.join()
+            logger.info("joined thread", logger.LogResult.success)
+
+    def _handleBets(self, clientMessage):
         messageBatch = clientMessage.split("\n")
         # Creo el objeto bet con los datos recibidos del cliente
         bets_list = []
@@ -85,7 +110,7 @@ class Server:
                         # Paso el agencyId al protocolo
                         protocol.setAgencyId(currentAgencyId)
 
-                    self._handle_bets(clientMessage)
+                    self._handleBets(clientMessage)
                     # Envio ack al cliente por haber completado el procesamiento del batch
                     if protocol.sendCode("ACK", message_amount) is None:
                         return None
@@ -101,6 +126,10 @@ class Server:
 
             # Se duerme el thread hasta que se cumpla el quorum
             self.agenciesQuorum.wait()
+
+            # Si el thread es despertado y el servidor se esta apagando, sale
+            if not self.active:
+                return None
 
             # Una vez que se cumple el quorum, obtengo cada ganador y armo el mensaje
             for bet in self.lottery.load_bets():
@@ -137,7 +166,9 @@ class Server:
             )
             raise e
         finally:
-            # Aseguro que siempre se cierre el socket
+            # Elimino el socket de la lista
+            self.client_sockets.remove(client_socket)
+            # Cierro el socket
             client_socket.close()
 
     def run(self):
@@ -145,17 +176,29 @@ class Server:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
             server_socket.bind((self.server_host, self.server_port))
             server_socket.listen()
-            while True:
+            # Guardo el socket para poder cerrarlo desde el stopServer
+            self.server_socket = server_socket
+
+            while self.active:
                 try:
                     logger.info(action, logger.LogResult.in_progress)
-                    client_socket, _ = server_socket.accept()
+                    client_socket, _ = self.server_socket.accept()
                     # Creo un thread para cada conexion nueva que llega
                     # Paso por parametro que funcion tiene que ejecutar el thread y los argumento
                     newConnection = Thread(target=self._handle_client, args=(client_socket,))
                     newConnection.start()
                     # Agrego el thread a la lista de threads
                     self.agencies.append(newConnection)
+                    # Agrego el socket a la lista de sockets activos
+                    self.client_sockets.append(client_socket)
+                except OSError:
+                    if not self.active:
+                        break
+                    logger.error(action, logger.LogResult.fail)
                 except Exception as e:
                     logger.error(action, logger.LogResult.fail)
                     raise e
                 logger.info(action, logger.LogResult.success)
+
+            # Una vez que se cierra el socket, espero a que todos los threads terminen su ejecucion
+            self._stopThreads()
