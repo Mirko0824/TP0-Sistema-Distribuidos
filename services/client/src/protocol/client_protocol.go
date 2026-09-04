@@ -33,7 +33,6 @@ type ClientProtocol struct {
 	headerBuf  []byte
 	codeBuf    []byte
 	sendBuf    []byte
-	receiveBuf []byte
 }
 
 func NewClientProtocol(conn net.Conn, agencyId string) *ClientProtocol {
