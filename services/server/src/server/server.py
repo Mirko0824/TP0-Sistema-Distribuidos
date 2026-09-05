@@ -3,7 +3,7 @@ import logger
 import safe_socket
 from lottery.lottery import Lottery
 from lottery.bet import Bet
-from threading import Thread, Lock, Event
+from threading import Thread, Lock, Event, Condition
 from protocol.server_protocol import ServerProtocol
 
 class Server:
@@ -13,11 +13,40 @@ class Server:
         self.agencyQuorumMin = agencyQuorumMin
         self.lottery = Lottery("all-bets.csv") # Inicializo la instancia de lottery
         self.lock = Lock() # Inicializo la instancia de lock
+        self.rwCondition = Condition(self.lock)
+        self.readers = 0
+        self.writersWaiting = 0
+        self.writersActive = False
         self.agencies = [] # Inicializo la lista de threads
         self.client_sockets = [] # Lista de sockets de clientes activos
         self.agenciesCompleted = 0 # Inicializo contador de agencias que completaron el envio
         self.agenciesQuorum = Event() # Inicializo el semaforo para para avisar que se cumplio el quorum
         self.active = True
+
+    def lockRead(self):
+        with self.rwCondition:
+            while self.writersActive or self.writersWaiting > 0:
+                self.rwCondition.wait()
+            self.readers += 1
+
+    def unlockRead(self):
+        with self.rwCondition:
+            self.readers -= 1
+            if self.readers == 0:
+                self.rwCondition.notify_all()
+
+    def lockWrite(self):
+        with self.rwCondition:
+            self.writersWaiting += 1
+            while self.readers > 0 or self.writersActive:
+                self.rwCondition.wait()
+            self.writersWaiting -= 1
+            self.writersActive = True
+
+    def unlockWrite(self):
+        with self.rwCondition:
+            self.writersActive = False
+            self.rwCondition.notify_all()
     
     def stopServer(self):
         self.active = False
@@ -62,9 +91,10 @@ class Server:
             # Agrego el bet a la lista
             bets_list.append(bet)
         # Guardo todas la lista de bets recibidas
-        # Uso lock aca para proteger de este metodo que es de uso compartido
-        with self.lock:
-            self.lottery.store_bets(bets_list)
+        # Uso lockWrite aca para proteger acceso de escritura al archivo
+        self.lockWrite()
+        self.lottery.store_bets(bets_list)
+        self.unlockWrite()
 
     def _handle_client(self, client_socket):
         # Inicializo la instancia del protocolo de servidor
@@ -132,6 +162,7 @@ class Server:
                 return None
 
             # Una vez que se cumple el quorum, obtengo cada ganador y armo el mensaje
+            self.lockRead()
             for bet in self.lottery.load_bets():
                 # Si el apostador no gano o no pertenece a la agencia actual, lo salteo
                 if (not self.lottery.has_won(bet)) or (bet.agency_id != currentAgencyId):
@@ -142,19 +173,24 @@ class Server:
                 
                 # Envio el codigo de operacion de winner al cliente
                 if protocol.sendCode("WINNER", message_amount) is None:
+                    self.unlockRead()
                     return None
                 message_amount += 1
 
                 # Recibo el codigo de operacion de ack de parte del cliente
                 if protocol.receiveOperationCode(message_amount) is None:
+                    self.unlockRead()
                     return None
                 message_amount += 1
 
                 # Envio el mensaje de ganador
                 if protocol.sendMessage(winnerBet, message_amount) is None:
+                    self.unlockRead()
                     return None
                 # Sumo 2 porque se envia header y mensaje
                 message_amount += 2
+
+            self.unlockRead()
 
             if protocol.sendCode("EOF", message_amount) is None:
                 return None
