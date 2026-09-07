@@ -13,10 +13,10 @@ class Server:
         self.agencyQuorumMin = agencyQuorumMin
         self.lottery = Lottery("all-bets.csv") # Inicializo la instancia de lottery
         self.lock = Lock() # Inicializo la instancia de lock
-        self.rwCondition = Condition(self.lock)
-        self.readers = 0
-        self.writersWaiting = 0
-        self.writersActive = False
+        self.rwCondition = Condition(self.lock) # Creo la condicion para el lock
+        self.readers = 0 # Inicio contador de lectores
+        self.writersWaiting = 0 # Inicio contador de escritores esperando
+        self.writersActive = False # Flag para indicar si hay un escritor activo
         self.agencies = [] # Inicializo la lista de threads
         self.client_sockets = [] # Lista de sockets de clientes activos
         self.agenciesCompleted = 0 # Inicializo contador de agencias que completaron el envio
@@ -24,28 +24,56 @@ class Server:
         self.active = True
 
     def lockRead(self):
+        # Adquiero el lock de lectura
         with self.rwCondition:
+            # Mientras exista un thread escribiendo o esperando para escribir
+            # Entonces llamo a wait para que suelte el lock y se duerma
             while self.writersActive or self.writersWaiting > 0:
+                # Si se corta la ejecucion del programa, salgo
+                if not self.active:
+                    # Devuelvo false para que entre en el finally del lock y libere el lock
+                    return False
                 self.rwCondition.wait()
+            # Puedo leer porque no hay nadie escribiendo ni esperando para escribir
+            # Incremento el contador de lectores
             self.readers += 1
+            return True
 
     def unlockRead(self):
+        # Adquiero el lock de lectura
         with self.rwCondition:
+            # Decremento el contador de lectores
             self.readers -= 1
+            # Si no hay nadie leyendo
             if self.readers == 0:
+                # Despierto a todos los threads que esten esperando el quorum
                 self.rwCondition.notify_all()
 
     def lockWrite(self):
+        # Adquiero el lock de lectura
         with self.rwCondition:
+            # Incremento el contador de threads esperando para escribir
             self.writersWaiting += 1
+            # Mientras existan threads leyendo o un thread escribiendo
             while self.readers > 0 or self.writersActive:
+                # Si se corta la ejecucion del programa, salgo
+                if not self.active:
+                    # Devuelvo false para que entre en el finally del lock y libere el lock
+                    self.writersWaiting -= 1
+                    return False
                 self.rwCondition.wait()
+            # Disminuyo el contador de threads esperando para escribir
             self.writersWaiting -= 1
+            # El thread que esta escribiendo
             self.writersActive = True
+            return True
 
     def unlockWrite(self):
+        # Adquiero el lock de lectura
         with self.rwCondition:
+            # El thread termino de escribir
             self.writersActive = False
+            # Despierto a todos los threads que esten esperando en los locks de lectura/escritura
             self.rwCondition.notify_all()
     
     def stopServer(self):
@@ -53,6 +81,10 @@ class Server:
         
         # Desbloqueo a todos los threads que esten esperando el quorum
         self.agenciesQuorum.set()
+
+        # Desbloqueo a todos los threads que esten esperando en los locks de lectura/escritura
+        with self.rwCondition:
+            self.rwCondition.notify_all()
         
         # Cierro todas las conexiones con los clientes para abortar inmediatamente cualquier lectura/escritura
         for sock in self.client_sockets:
@@ -92,7 +124,8 @@ class Server:
             bets_list.append(bet)
         # Guardo todas la lista de bets recibidas
         # Uso lockWrite aca para proteger acceso de escritura al archivo
-        self.lockWrite()
+        if not self.lockWrite():
+            return
         self.lottery.store_bets(bets_list)
         self.unlockWrite()
 
@@ -162,7 +195,8 @@ class Server:
                 return None
 
             # Una vez que se cumple el quorum, obtengo cada ganador y armo el mensaje
-            self.lockRead()
+            if not self.lockRead():
+                return None
             for bet in self.lottery.load_bets():
                 # Si el apostador no gano o no pertenece a la agencia actual, lo salteo
                 if (not self.lottery.has_won(bet)) or (bet.agency_id != currentAgencyId):
